@@ -345,6 +345,23 @@ def normalize_hy_v3_rope_config(cfg: dict) -> dict:
     return cfg
 
 
+# Official SenseNova-Loop family markers (ModelScope `SenseNova/SenseNova-Loop-9B`).
+# The vendor publishes the checkpoint as a vLLM-style multimodal config
+# (`model_type="sensenova_loop"`, `architectures=["SenseNovaLoopForConditionalGeneration"]`)
+# whose text backbone is byte-identical to mlx-lm's qwen3_5 text_config. oMLX routes
+# the official marker to the qwen3_5 text implementation; the VLM-only vision keys
+# (vision_config / image_token_id / ...) are ignored by qwen3_5.Model and the
+# `model.visual.*` weights are dropped by its sanitize, so the same config loads as
+# a text-only model. Keeping the official marker in config.json (instead of
+# rewriting it to qwen3_5 on disk) means a stock official checkpoint plus this
+# patch loads unchanged -- the PR is usable by downstream users.
+_SENSENOVA_LOOP_MODEL_TYPES = ("sensenova_loop", "sensenova_loop_text")
+_SENSENOVA_LOOP_ARCHITECTURES = (
+    "SenseNovaLoopForConditionalGeneration",
+    "SenseNovaLoopForCausalLM",
+)
+
+
 def normalize_laguna_compressed_quant(cfg: dict) -> dict:
     """Map Laguna compressed-tensors metadata to mlx-lm quantization settings.
 
@@ -489,10 +506,57 @@ def _patch_mlx_lm_load_config() -> None:
         normalize_mimo_mxfp4_quant(cfg)
         normalize_inkling2_modelopt_quant(cfg)
         normalize_raon1_mini_model_file(cfg)
+        _merge_qc_per_path_into_quantization(cfg, model_path)
         return cfg
 
     _lu.load_config = _patched
     _MLX_LM_LOAD_CONFIG_PATCHED = True
+
+
+def _merge_qc_per_path_into_quantization(cfg: dict, model_path: str | Path | None = None) -> None:
+    """Merge ``quantization_config`` per-path entries into ``quantization``.
+
+    Pre-quantized checkpoints (MiniCPM5-2B, mixed bit-width) put the
+    per-layer quantization spec in ``quantization_config`` while
+    ``quantization`` holds only the global default. mlx-vlm's
+    ``nn.quantize`` class_predicate reads only ``config["quantization"]``,
+    so merge the per-path entries so it can build each layer at the correct
+    bit-width.
+
+    Scoped to the MiniCPM5 family: the merge exists solely to serve the
+    MiniCPM5 pre-quantized ``llama`` checkpoints that carry a mixed
+    bit-width ``quantization_config``. Pass ``model_path`` so the caller can
+    restrict the merge to ``llama`` checkpoints; when it is None or does not
+    resolve to ``llama``, the merge is a no-op. This keeps the helper from
+    rewriting quantization for unrelated mlx-lm loads (jundot #5275 review).
+    """
+    # Only the MiniCPM5 family (text-only llama with a mixed per-path
+    # quantization_config) needs this merge; gate on the declared model_type.
+    # Skip only when the path is readable AND resolves to a non-llama type;
+    # an unreadable path (model_type None) falls through to the content
+    # guards below rather than being silently skipped.
+    if model_path is not None:
+        mt = _config_model_type(model_path)
+        if mt is not None and mt != "llama":
+            return
+    quant = cfg.get("quantization")
+    qc = cfg.get("quantization_config")
+    if not isinstance(quant, dict) or not isinstance(qc, dict):
+        return
+    # Only merge when quantization is a bare global default (no per-path).
+    if any(isinstance(v, dict) or v is False for v in quant.values()):
+        return
+    per_path = {
+        k: v for k, v in qc.items()
+        if isinstance(v, dict) or v is False
+    }
+    if not per_path:
+        return
+    # Preserve the global defaults as the top-level recipe.
+    merged = dict(quant)
+    for k, v in per_path.items():
+        merged.setdefault(k, v)
+    cfg["quantization"] = merged
 
 
 def _checkpoint_has_t5_weights(model_path: str | Path) -> bool:
@@ -804,6 +868,19 @@ def maybe_apply_pre_load_patches(
 
         if apply_inkling2_patch():
             logger.info("Inkling 2 pre-load patch applied for %s", model_name)
+
+    # SenseNova Loop: register the self-contained Loop/MHC architecture
+    # (mlx_lm.models.sensenova_loop) **independent of MTP**.  The Loop/MHC
+    # classes must exist before mlx-lm resolves the model classes, whether or
+    # not an MTP head is present.  The MTP slot/rollback adaptation is applied
+    # separately (sensenova_loop_mtp.apply_mtp) only when MTP is active.
+    if model_type in _SENSENOVA_LOOP_MODEL_TYPES:
+        from ..patches.mlx_lm_mtp.sensenova_loop import apply as apply_sl_arch
+
+        if apply_sl_arch():
+            logger.info(
+                "SenseNova Loop architecture registered for %s", model_name
+            )
 
     text_config = config.get("text_config")
     text_model_type = (
@@ -1392,6 +1469,14 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         "gemma4",
         "gemma4_unified",
         "muse_glimmer",
+        # Spark X2.5/X2.6 text-only loaded via mlx-vlm with its own
+        # SparkDSpark batched drafter (capture_layer_ids patched).
+        "spark2_5",
+        # Text-only llama (e.g. MiniCPM5-2B) loaded via mlx-vlm so the
+        # block-drafter (DFlash/DSpark) path is available; its LanguageModel
+        # carries capture_layer_ids / rollback_speculative_cache through
+        # omlx.patches.minicpm5_dspark.
+        "llama",
     ),
     "batched": (
         "qwen3_5",
@@ -1401,6 +1486,10 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         "laguna",
         "mimo_v2",
         "mimo_v2_flash",
+        "spark2_5",
+        # Text-only llama (MiniCPM5-2B) via mlx_lm on the batched engine so
+        # DFlash/DSpark is available without VLM forcing.
+        "llama",
     ),
 }
 
@@ -1486,6 +1575,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type == "step3p7"
         or model_type == "bailing_hybrid"
         or model_type in ("hy_v4_vl", "hy_v4_flash")
+        or model_type in _SENSENOVA_LOOP_MODEL_TYPES
     )
 
 
