@@ -583,7 +583,6 @@ def _patch_text_model(q35: Any) -> None:
             # mtp_partial_rollback (no gdn_states).
             return SimpleNamespace(
                 logits=out,
-                hidden_states=captured + ([hidden] if return_hidden else []),
                 gdn_states=None,
             )
         if return_hidden:

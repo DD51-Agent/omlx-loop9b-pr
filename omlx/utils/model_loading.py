@@ -881,6 +881,16 @@ def maybe_apply_pre_load_patches(
             logger.info(
                 "SenseNova Loop architecture registered for %s", model_name
             )
+            # SenseNova-Loop DFlash2 (5-feature fc) adaptation, applied after
+            # the Loop architecture registers; all edits live in
+            # patches/sensenova_loop_dflash.py.
+            from ..patches.sensenova_loop_dflash import apply as apply_sl_dflash
+
+            if apply_sl_dflash():
+                logger.info(
+                    "SenseNova Loop DFlash2 adaptation applied for %s",
+                    model_name,
+                )
 
     text_config = config.get("text_config")
     text_model_type = (
@@ -1490,6 +1500,11 @@ _DFLASH_BATCHED_MODEL_TYPES = {
         # Text-only llama (MiniCPM5-2B) via mlx_lm on the batched engine so
         # DFlash/DSpark is available without VLM forcing.
         "llama",
+        # SenseNova-Loop (5-feature DFlash2 drafter) on the batched engine.
+        # Registered in source (not a runtime patch) so the DFlash2 adaptation
+        # stays framework-agnostic like MiniCPM5's llama whitelist entry.
+        "sensenova_loop",
+        "sensenova_loop_text",
     ),
 }
 
